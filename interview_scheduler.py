@@ -3,11 +3,75 @@
 from __future__ import annotations
 
 from pathlib import Path
+import re
+import unicodedata
 
 import pandas as pd
 from ortools.sat.python import cp_model
 
 OUTPUT_DIR = Path(__file__).resolve().parent / "outputs"
+
+
+class SchedulerInfeasibleError(RuntimeError):
+    """Raised when CP-SAT cannot find a feasible interview schedule."""
+
+
+ROLE_ALIASES = {
+    "event operator (entertainment and arts)": "event operator (entertainment & arts)",
+    "event operator (entertaiment & arts)": "event operator (entertainment & arts)",
+    "event operator (sport)": "event operator (sports)",
+    "event operator (voluteers)": "event operator (volunteers)",
+}
+
+
+def normalize_role(value: object) -> str:
+    """Return a case-insensitive canonical key for matching roles."""
+    text = unicodedata.normalize("NFKC", str(value)).strip().casefold()
+    text = re.sub(r"\s+", " ", text)
+    return ROLE_ALIASES.get(text, text)
+
+
+def normalize_time_slot(value: object) -> str:
+    """Normalize variants such as ``8:00-9:00`` to ``08:00-09:00``."""
+    text = str(value).strip()
+    match = re.fullmatch(r"(\d{1,2})\s*:\s*(\d{2})\s*-\s*(\d{1,2})\s*:\s*(\d{2})", text)
+    if not match:
+        raise ValueError(
+            f"Invalid time slot {value!r}. Expected format HH:MM-HH:MM, "
+            "for example 08:00-09:00."
+        )
+    start_hour, start_minute, end_hour, end_minute = (
+        int(part) for part in match.groups()
+    )
+    if not (0 <= start_hour <= 23 and 0 <= end_hour <= 23):
+        raise ValueError(f"Invalid hour in time slot {value!r}.")
+    if not (0 <= start_minute <= 59 and 0 <= end_minute <= 59):
+        raise ValueError(f"Invalid minute in time slot {value!r}.")
+    return f"{start_hour:02d}:{start_minute:02d}-{end_hour:02d}:{end_minute:02d}"
+
+
+def build_time_slots(
+    start_time: str = "08:00",
+    end_time: str = "17:00",
+    break_start: str = "12:00",
+    break_end: str = "13:00",
+) -> list[str]:
+    """Build one-hour slots and omit the configured break interval."""
+    start = pd.Timestamp(start_time)
+    end = pd.Timestamp(end_time)
+    break_start_timestamp = pd.Timestamp(break_start)
+    break_end_timestamp = pd.Timestamp(break_end)
+    if end <= start or (end - start) % pd.Timedelta(hours=1) != pd.Timedelta(0):
+        raise ValueError("Start/end time must define a positive whole number of hours.")
+
+    slots = []
+    current = start
+    while current < end:
+        next_time = current + pd.Timedelta(hours=1)
+        if not (current < break_end_timestamp and next_time > break_start_timestamp):
+            slots.append(f"{current:%H:%M}-{next_time:%H:%M}")
+        current = next_time
+    return slots
 
 
 def build_mock_data() -> tuple[pd.DataFrame, pd.DataFrame, list[str], list[str]]:
@@ -198,13 +262,61 @@ def build_mock_data() -> tuple[pd.DataFrame, pd.DataFrame, list[str], list[str]]
     return candidates, interviewers, time_slots, tables
 
 
-def solve_schedule(
-    candidates: pd.DataFrame,
-    interviewers: pd.DataFrame,
-    time_slots: list[str],
-    tables: list[str],
-) -> tuple[pd.DataFrame, pd.DataFrame, int]:
-    """Create, solve, and export the interview schedule."""
+def run_scheduler(
+    candidates_df: pd.DataFrame,
+    interviewers_df: pd.DataFrame,
+    *,
+    number_tables: int = 15,
+    start_time: str = "08:00",
+    end_time: str = "17:00",
+    break_start: str = "12:00",
+    break_end: str = "13:00",
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Solve the schedule and return the flat and matrix result DataFrames."""
+    required_candidate_columns = {"id", "aspirations", "preferred_slots"}
+    required_interviewer_columns = {"id", "name", "roles"}
+    missing_candidates = required_candidate_columns - set(candidates_df.columns)
+    missing_interviewers = required_interviewer_columns - set(interviewers_df.columns)
+    if missing_candidates or missing_interviewers:
+        raise ValueError(
+            "Missing columns: "
+            f"candidates={sorted(missing_candidates)}, "
+            f"interviewers={sorted(missing_interviewers)}"
+        )
+    if number_tables < 1:
+        raise ValueError("number_tables must be at least 1.")
+
+    candidates = candidates_df.copy()
+    interviewers = interviewers_df.copy()
+    candidates["aspirations"] = candidates["aspirations"].apply(
+        lambda roles: [role for role in roles if str(role).strip()]
+    )
+    interviewers["roles"] = interviewers["roles"].apply(
+        lambda roles: [role for role in roles if str(role).strip()]
+    )
+    if "name" not in candidates.columns:
+        candidates["name"] = candidates["id"].astype(str)
+    candidates["preferred_slots"] = candidates["preferred_slots"].apply(
+        lambda slots: [normalize_time_slot(slot) for slot in slots]
+    )
+    time_slots = build_time_slots(start_time, end_time, break_start, break_end)
+    tables = [f"Table {number}" for number in range(1, number_tables + 1)]
+    if not time_slots:
+        raise ValueError("The configured time range contains no available slots.")
+    unavailable_slots = sorted(
+        {
+            slot
+            for slots in candidates["preferred_slots"]
+            for slot in slots
+            if slot not in time_slots
+        }
+    )
+    if unavailable_slots:
+        raise ValueError(
+            "Candidate preferred slots are unavailable or outside the configured "
+            f"schedule: {unavailable_slots}"
+        )
+
     model = cp_model.CpModel()
     candidate_ids = candidates["id"].tolist()
     interviewer_ids = interviewers["id"].tolist()
@@ -242,7 +354,9 @@ def solve_schedule(
             for table in tables:
                 model.Add(x[candidate_id, slot, table] == 0)
 
-    # Each table is either empty or has exactly one candidate.
+    # Each table is either empty or has exactly one candidate. There is no
+    # constraint across tables for the same slot, so multiple tables can run
+    # concurrently in one time slot.
     table_occupancy = {}
     for slot in time_slots:
         for table in tables:
@@ -256,24 +370,34 @@ def solve_schedule(
             interviewer_vars = [
                 y[interviewer_id, slot, table] for interviewer_id in interviewer_ids
             ]
-            # Empty tables get no interviewers; active tables get 3 or 4.
-            model.Add(sum(interviewer_vars) >= 3 * occupancy)
+            # Empty tables get no interviewers; active tables get 1 to 4.
+            model.Add(sum(interviewer_vars) >= occupancy)
             model.Add(sum(interviewer_vars) <= 4 * occupancy)
 
-    # An interviewer cannot work two tables during one slot.
+    # An interviewer cannot work two tables during one slot, but can cover
+    # multiple aspirations for the candidate at their one assigned table.
     for interviewer_id in interviewer_ids:
         for slot in time_slots:
             model.Add(sum(y[interviewer_id, slot, table] for table in tables) <= 1)
 
     # Skill covering: each candidate skill is a Boolean OR over the qualified
     # interviewers at that table. AddImplication then requires that OR to be
-    # true whenever the candidate is assigned. Because skills are composite
-    # strings, Sports_EventOperator and Volunteers_EventOperator remain
+    # true whenever the candidate is assigned. The same y[i, slot, table]
+    # variable participates in every role that interviewer can cover, so one
+    # interviewer can satisfy multiple aspirations for one candidate. Because
+    # skills are composite strings, similarly named department roles remain
     # different exact-match skills.
-    interviewer_roles = interviewers.set_index("id")["roles"].to_dict()
+    interviewer_roles = {
+        interviewer_id: {normalize_role(role) for role in roles if str(role).strip()}
+        for interviewer_id, roles in interviewers.set_index("id")["roles"].items()
+    }
     for _, candidate in candidates.iterrows():
         candidate_id = candidate["id"]
-        required_roles = set(candidate["aspirations"])
+        required_roles = {
+            normalize_role(role)
+            for role in candidate["aspirations"]
+            if str(role).strip()
+        }
         for slot in candidate["preferred_slots"]:
             for table in tables:
                 assignment = x[candidate_id, slot, table]
@@ -292,18 +416,21 @@ def solve_schedule(
                         model.AddMaxEquality(role_covered, qualified_interviewers)
                         model.AddImplication(assignment, role_covered)
 
-    # A large primary weight makes interviewer minimization lexicographically
-    # secondary to scheduling as many candidates as possible.
-    max_interviewer_assignments = len(interviewer_ids) * len(time_slots)
-    primary_weight = max_interviewer_assignments + 1
-    model.Maximize(primary_weight * sum(is_scheduled.values()) - sum(y.values()))
+    # Every input candidate is required to have exactly one assignment. If the
+    # resources, preferred slots, or skills cannot support everyone, CP-SAT
+    # returns INFEASIBLE instead of silently returning a partial schedule.
+    model.Add(sum(is_scheduled.values()) == len(candidate_ids))
+
+    # With all candidates mandatory, minimize interviewer usage as the
+    # secondary objective.
+    model.Minimize(sum(y.values()))
 
     solver = cp_model.CpSolver()
     solver.parameters.max_time_in_seconds = 30
     solver.parameters.num_search_workers = 8
     status = solver.Solve(model)
     if status not in (cp_model.OPTIMAL, cp_model.FEASIBLE):
-        raise RuntimeError(
+        raise SchedulerInfeasibleError(
             f"No feasible schedule found. Solver status: {solver.StatusName(status)}"
         )
 
@@ -367,26 +494,21 @@ def solve_schedule(
     )
     df_matrix.index.name = "Tables"
 
-    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-    df_flat.to_csv(OUTPUT_DIR / "interview_schedule_flat.csv", index=False)
-    df_matrix.to_csv(OUTPUT_DIR / "interview_schedule_matrix.csv")
-    return (
-        df_flat,
-        df_matrix,
-        sum(solver.Value(value) for value in is_scheduled.values()),
-    )
+    return df_flat, df_matrix
 
 
 def main() -> None:
-    candidates, interviewers, time_slots, tables = build_mock_data()
-    df_flat, df_matrix, scheduled_count = solve_schedule(
-        candidates, interviewers, time_slots, tables
-    )
+    candidates, interviewers, _, _ = build_mock_data()
+    df_flat, df_matrix = run_scheduler(candidates, interviewers)
+    scheduled_count = len(df_flat)
     print(f"Successfully scheduled candidates: {scheduled_count}/{len(candidates)}")
     print("\nFlat schedule:")
     print(df_flat.to_string(index=False))
     print("\nMatrix schedule:")
     print(df_matrix.to_string())
+    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    df_flat.to_csv(OUTPUT_DIR / "interview_schedule_flat.csv", index=False)
+    df_matrix.to_csv(OUTPUT_DIR / "interview_schedule_matrix.csv")
     print(f"\nCSV files written to: {OUTPUT_DIR}")
 
 
